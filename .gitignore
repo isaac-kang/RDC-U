@@ -1,3 +1,19 @@
+# python
+__pycache__/
+*.pyc
+
+# media / weights
 *.jpg
 *.pth
-Union14M/checkpoints/
+
+# external deps (sparse-cloned by data_env_and_download_weights.sh, not part of repo)
+Union14M/
+local-models/
+
+# rdc-u 출력 (lmdb / index / preview / crops / done-marker 등 모두 안쪽에)
+out_*/
+DEBUG/
+
+# 옛 실험 디렉토리
+compare/
+compare_out*/
