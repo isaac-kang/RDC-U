@@ -1,75 +1,94 @@
 # RDC-U — Recap-DataComp 에서 mining 하는 unlabeled STR crop 데이터셋
 
-전체 흐름: parquet `re_caption` 의 regex 필터 → URL fetch → DBNet++ STD → rotate-crop.
+전체 흐름: parquet `re_caption` 의 regex 필터 → URL fetch → 3-detector ensemble (DBNet++ / FCENet / MaskRCNN, all R50-oCLIP IC15) → unanimous IoU>0.7 voting → axis-aligned bbox crop.
 
-명명 규칙: U14M-L (labeled) / U14M-U (unlabeled) 와 동일한 의미의 "-U" — 글자 transcription 라벨은 없는 unlabeled crop 모음.
+명명 규칙: U14M-L (labeled) / U14M-U (unlabeled) 와 동일 의미의 "-U" — 글자 transcription 라벨은 없는 unlabeled crop 모음.
 
 ---
 
-## 1. caption 기반 후보 sample 추출 — `sample_recap_datacomp.py`
+## 통합 framework — `rdc-u.py`
+
+`--steps` 로 stage 를 골라/조합해 실행. public step 은 두 개만 둔다.
+
+| stage | 번호 | 역할 | 산출물 |
+|---|---|---|---|
+| `filter` | `1` | parquet text column만 보고 caption STR filter 적용. 매치 row index를 `.npy` 로 저장하고, 일부 filtered row는 이미지+텍스트 HTML로 검수 | `<out>/index/<shard>.npy`, `<out>/index/SUMMARY.json`, `<out>/filter_preview.html` |
+| `crop`   | `2` | filter index에 걸린 row만 URL fetch → 3-detector ensemble forward → unanimous IoU voting (paper 방식) → 3 polygon 의 minimum axis-aligned rect 로 crop. crop preview HTML 저장 | `<out>/lmdb/`, `<out>/crops/<key>.jpg` (opt-in), `<out>/crops_preview.html` |
+
+**의존성**: `crop` 은 같은 `--out_root` 안의 `index/<shard>.npy` 를 읽어 매치 row 만 sparse 접근. index 없는 shard 는 자동 skip. `crop` 단독 실행 (`--steps 2`) 전에 step 1 을 한번 돌려야 함. default `python rdc-u.py` 는 1→2 순서로 돌아 crop 에 필요한 index 를 자동 생성함.
+
+**기본 동작 = small crop 모드.** default 로 `--steps` 미지정 시 filter+crop(1,2), `--max_shards 1`, `--filter_preview_n 10`, `--target 100`. 풀 실행하려면 `--full` 또는 `--max_shards 0 --target 0` 명시.
+
+`--steps` 는 이름 또는 번호 사용 가능. 숫자 alias 는 `1=filter`, `2=crop`. `index` 는 `filter` 의 legacy 이름으로 허용.
 
 ```bash
-# 빠른 검수용: filter 없이 10장
-python sample_recap_datacomp.py
+# 기본: text filter + filter preview, 그 다음 crop + crop preview
+python rdc-u.py
 
-# STR 신호 (인용부호 / tier-1 동사) 만 필터해서 N장
-python sample_recap_datacomp.py --filter str --n 100 --out ./recap_str_samples
+# 단일 stage
+python rdc-u.py --steps 1            # filter index + filter preview
+python rdc-u.py --steps 2            # 1 shard 안에서 100 crop 채우면 stop
+python rdc-u.py --steps 1,2          # filter + crop 작게
+python rdc-u.py --fresh              # 기존 filter/crop 산출물 지우고 처음부터
+python rdc-u.py --fresh --steps 2    # index 는 유지하고 crop 산출물만 새로
 
-# 다른 seed/timeout
-python sample_recap_datacomp.py --filter str --n 200 --seed 7 --timeout 12
+# 풀 실행
+python rdc-u.py --full                                     # 전체 데이터 filter + crop
+python rdc-u.py --steps 2 --max_shards 0 --target 100000   # cap 만 지정
 ```
-
-산출물:
-- `<out>/recap_NNNNN.jpg` — 다운로드된 이미지
-- `<out>_preview.html` — caption highlight 된 시각 검수 페이지
 
 자주 쓰는 flag:
-- `--filter str` — `caption_has_str_signal()` 통과한 row 만 (caption 거른 건 `max_attempts` 에 안 셈)
-- `--shuffle_buffer` — 0 이면 shuffle 안 함 (decode 디버깅용)
-- `--no_html` — preview HTML skip
-- `--max_attempts` — URL 죽은 비율 높을 때 상한 늘리기
 
-## 2. 전체 shard 에 strict filter index — `build_str_index.py`
+| flag | step | 의미 |
+|---|---|---|
+| `--out_root` | 모두 | 출력 루트 (default `./out_rdc-u`) |
+| `--full` | 모두 | shortcut: `--max_shards 0 --target 0` (전체 처리) |
+| `--fresh` | 모두 | 요청한 step의 기존 산출물을 지우고 시작. `--steps 2`와 쓰면 index는 유지하고 crop만 reset |
+| `--max_shards N` | filter, crop | shard 상한 (0 = all). default **1** |
+| `--workers N` | filter | shard 동시 scan 스레드 |
+| `--filter_preview_n N` | filter | filtered 이미지+텍스트 HTML preview 장수. default **10**, 0이면 disable |
+| `--filter_preview_threads N` | filter | filter preview URL fetch 병렬 수. default **32** |
+| `--num_gpus N` | crop | ensemble inference GPU 수 (0 = `torch.cuda.device_count()`) |
+| `--target N` | crop | ensemble 입력 N장 처리하면 stop (0 = no cap). default **100** |
+| `--score_thr` | crop | per-detector polygon score 컷 (voting 전 단계, mmocr default **0.3**) |
+| `--iou_thr` | crop | IoU voting 임계값. 모든 pair IoU 가 이 값 초과해야 consensus (paper 0.7) |
+| `--batch_size` | crop | per-GPU ensemble batch (default **4**, bs=8 까지 검증됨, bs≥10 OOM 위험) |
+| `--fetch_threads` | crop | URL fetch ThreadPool 크기 (default 128) |
+| `--shard_mod / --shard_rem` | crop | 멀티 머신 분산용 shard 분할 |
+| `--crop_preview_n N` | crop | 개발용: N 장은 원본 + polygon overlay HTML 저장 (default 20) |
 
-caption pass row index 만 shard 별 `.npy` 로 저장 (이미지 다운로드 X). resume 가능.
+### 출력 디렉토리 구조
 
-```bash
-python build_str_index.py                       # 디폴트 8 workers, 4627 shards
-python build_str_index.py --workers 16
-python build_str_index.py --max_shards 10       # 작게 calibration
-python build_str_index.py --force               # 기존 .npy 무시
+```
+<out_root>/
+├── index/                                # step:filter index cache
+│   ├── train-00000-of-04627.npy
+│   └── SUMMARY.json
+├── filter_preview/                       # step:filter preview images
+│   └── recap_00000.jpg ...
+├── filter_preview.html                   # step:filter preview HTML
+├── crops/                                # step:crop (메인 산출물)
+│   └── train-00042-of-04627__r00012345__c00.jpg ...
+├── debug/originals/                      # step:crop, --crop_preview_n>0
+│   └── train-00042-of-04627__r00012345.jpg ...
+├── crops_preview.html                    # step:crop, --crop_preview_n>0
+├── lmdb/                                 # step:crop (메인 산출물, Union14M-U format)
+└── _done_shards.txt                      # step:crop resume marker
 ```
 
-실측 (10 shards, 8 workers): wall **60s**, rows **2.03M**, matched **709K**, **pass rate 34.86%** (`recap_str_index/SUMMARY.json`).
+### 단계별 timing
 
-## 3. DBNet++ STD → crop — `crop_with_dbnetpp.py`
+실행 마지막에 `[summary]` 블록이 한 번 더 출력된다. 작업 순서대로 `total → step 1 filter → filter preview → step 2 crop → crop pipeline` 을 보여주고, 각 항목은 실제 elapsed `wall` 과 병렬 작업 누적 `worker-sum` 을 분리해서 적는다.
 
-```bash
-# 디폴트: ./recap_str_samples 에서 5장 처리, ./recap_str_crops 에 저장
-python crop_with_dbnetpp.py
-
-python crop_with_dbnetpp.py --n 50 --score_thr 0.3
-python crop_with_dbnetpp.py --in_dir ./other_dir --out ./other_crops
-```
-
-산출물:
-- `<out>/crops/<stem>__NN.jpg`
-- `<out>_preview.html` (polygon overlay + crops)
-
-전제: `data_env.sh` 로 mmocr 스택 설치 완료. weights 는 `~/STR/Union14M/checkpoints/dbnetpp_oclip.pth`.
+`worker-sum` 은 병렬 fetch thread나 여러 GPU에서 동시에 돈 시간을 더한 값이라 실제 wall time보다 클 수 있다. 실제 기다린 시간은 각 줄의 `wall` 을 보면 된다.
 
 ---
 
 ## 환경
 
-- `data_env.sh` — conda env `data` 에 HF stream + mmocr (DBNet++) 스택 설치
-- 외부 의존: `~/STR/Union14M` (mmocr-dev-1.x config + `tools/rotate_crop.py`)
-
-## 현재 산출물
-
-| 폴더 | 내용 |
-|---|---|
-| `recap_datacomp_samples/` | filter 없이 받은 baseline 10장 |
-| `recap_str_samples/` | `--filter str` 통과 100장 |
-| `recap_str_crops/crops/` | DBNet++ 가 잘라낸 word-level crop (5장 → 68개) |
-| `recap_str_index/` | 10 shards 의 caption-pass row index `.npy` + `SUMMARY.json` |
+- `data_env.sh` — conda env `data` 에 HF stream + mmocr 스택 설치
+- 외부 의존: `Union14M/` (mmocr-dev-1.x configs)
+- detector weights (`Union14M/checkpoints/`):
+  - `dbnetpp_oclip.pth`  — DBNet++ R50-oCLIP IC15
+  - `fcenet_oclip.pth`   — FCENet R50-oCLIP IC15
+  - `maskrcnn_oclip.pth` — MaskRCNN R50-oCLIP IC15
