@@ -435,9 +435,6 @@ def run_index(args):
         'wall_seconds': round(wall, 1),
         'workers': args.workers,
     }
-    (out_dir / 'SUMMARY.json').write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False))
-
     print(f'[filter] timing  : wall {fmt_secs(wall)}')
     rows_txt = f'{rows_total:,}' if rows_total else 'unknown (cached index)'
     rate_txt = f' ({100 * match_rate:.2f}%)' if match_rate is not None else ''
@@ -1029,12 +1026,16 @@ def _normalize_pred(preds_dict):
     return {'polygons': polys, 'scores': ss}
 
 
-def _predict_batch_raw(predictor, imgs_bgr):
+def _predict_batch_raw(predictor, imgs_bgr, fp16=False):
     """list of HxWx3 uint8 BGR → list of model output dict (each has 'instances').
 
     DefaultPredictor 의 single-image __call__ 을 우회하고 model 에 list 직접 전달.
     detectron2 GeneralizedRCNN/meta_arch 가 backbone 단계에서 padding 후 batch forward 하므로
     실제 GPU throughput 이 batch dim 만큼 scale 됨 (가변 size 는 padding 비용 있음).
+
+    fp16=True 시 torch.autocast(cuda, fp16) 으로 mixed precision inference.
+    weights 는 fp32 유지 — autocast 가 op 별 fp16 kernel 자동 dispatch (deformable
+    attention 같이 fp16 kernel 없는 custom op 는 fp32 fallback).
     """
     import torch
     if not imgs_bgr:
@@ -1049,6 +1050,11 @@ def _predict_batch_raw(predictor, imgs_bgr):
         t = torch.as_tensor(t.astype('float32').transpose(2, 0, 1))
         inputs.append({'image': t, 'height': h, 'width': w})
     with torch.no_grad():
+        if fp16:
+            # torch 1.9 의 cuda.amp.autocast 는 dtype 인자 없음 (torch 1.10+ 만 지원).
+            # default 가 fp16 이므로 무인자로 호출.
+            with torch.cuda.amp.autocast():
+                return predictor.model(inputs)
         return predictor.model(inputs)
 
 
@@ -1063,12 +1069,14 @@ def _is_cuda_oom(exc):
 
 
 def _safe_predict_batch(predictor, imgs_bgr, stats, device):
-    """OOM 발생 시 batch 를 절반으로 쪼개 재귀 retry. 1장에서도 OOM 이면 그 image skip."""
+    """OOM 발생 시 batch 를 절반으로 쪼개 재귀 retry. 1장에서도 OOM 이면 그 image skip.
+    fp16 여부는 stats['fp16'] 로 읽음 (run_crop 에서 1회 set)."""
     import torch
     if not imgs_bgr:
         return []
+    fp16 = bool(stats.get('fp16', False))
     try:
-        return _predict_batch_raw(predictor, imgs_bgr)
+        return _predict_batch_raw(predictor, imgs_bgr, fp16=fp16)
     except Exception as e:
         if _is_cuda_oom(e):
             torch.cuda.empty_cache()
@@ -1345,6 +1353,7 @@ def _crop_run_suffix(args) -> str:
     - target_crops > 0 → `_tN`  (N = short form, 예: 1M, 100K)
     - max_keep < 100 → `_kN`   (max_keep=100 은 default 라 생략 — backwards compat)
     - shard_mod > 1 → `_wRR`   (cluster split)
+    - fp16 → `_fp16`           (mixed precision inference)
     """
     parts = []
     if args.target_crops > 0:
@@ -1353,6 +1362,8 @@ def _crop_run_suffix(args) -> str:
         parts.append(f'k{args.max_keep}')
     if args.shard_mod > 1:
         parts.append(f'w{args.shard_rem:02d}')
+    if getattr(args, 'fp16', False):
+        parts.append('fp16')
     return '_' + '_'.join(parts) if parts else ''
 
 
@@ -1476,6 +1487,25 @@ def run_crop(args):
     except ImportError:
         from detectron2.config import get_cfg as _get_cfg  # type: ignore
 
+    # fp16: MSDeformAttn custom CUDA op (_C.ms_deform_attn_forward) 은 fp16 kernel
+    # 미구현이라 autocast 가 fp16 입력 넣으면 RuntimeError. custom_fwd(cast_inputs=fp32)
+    # 로 wrap → autocast 안에서도 이 op 만 fp32 입력으로 호출. 나머지 (ResNet50 등) 는
+    # fp16 dispatch 유지.
+    if getattr(args, 'fp16', False):
+        import torch as _torch
+        from adet.layers.ms_deform_attn import _MSDeformAttnFunction
+        _orig_msda_fwd = _MSDeformAttnFunction.forward
+        if hasattr(_orig_msda_fwd, '__func__'):
+            _orig_msda_fwd = _orig_msda_fwd.__func__
+
+        @staticmethod
+        @_torch.cuda.amp.custom_fwd(cast_inputs=_torch.float32)
+        def _fp32_msda_fwd(ctx, *fwd_args):
+            return _orig_msda_fwd(ctx, *fwd_args)
+        _MSDeformAttnFunction.forward = _fp32_msda_fwd
+        print('[crop] fp16: MSDeformAttn._MSDeformAttnFunction.forward wrapped '
+              'with custom_fwd(cast_inputs=fp32)')
+
     predictors_per_dev = []  # list[device_idx] -> list[(name, predictor)]
     for dev in devices:
         dev_preds = []
@@ -1507,6 +1537,7 @@ def run_crop(args):
     stats = {
         'lock': threading.Lock(),
         'pbar': pbar,
+        'fp16': bool(getattr(args, 'fp16', False)),
         'imgs': 0, 'crops': 0,
         'target': args.target, 'target_crops': args.target_crops,
         'fetch_cap': fetch_cap, 'n_submitted': 0, 'n_skipped_by_cap': 0,
@@ -1770,7 +1801,7 @@ def run_crop(args):
 
     preview_html = None
     if args.crop_preview_n > 0 and preview_items:
-        html_path = args.out_root / 'crops_preview.html'
+        html_path = args.out_root / f'crops_preview{suffix}.html'
         html_path.write_text(
             _render_crops_preview(preview_items, debug_orig_dir), encoding='utf-8')
         print(f'[crop] preview : {html_path}')
@@ -1806,6 +1837,25 @@ def run_crop(args):
 # ═════════════════════════════════════════════════════════════════════════
 # CLI
 # ═════════════════════════════════════════════════════════════════════════
+
+def _write_run_summary(args, total_wall, summaries):
+    """전체 실행 통계를 out_root/SUMMARY{suffix}.json 으로 저장.
+    LMDB/crops 와 동일한 suffix (예: _t10K_k5) 를 써서 setting 별로 분리.
+    args 직렬화 시 Path/tuple 등은 default=str 로 fallback."""
+    payload = {
+        'dataset': getattr(args, 'dataset', None),
+        'steps_requested': args.steps,
+        'total_wall_seconds': round(total_wall, 1),
+        'args': vars(args),
+        'steps': {s.get('step', f'step_{i}'): s
+                  for i, s in enumerate(summaries)},
+    }
+    suffix = _crop_run_suffix(args)
+    out_path = args.out_root / f'SUMMARY{suffix}.json'
+    out_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    print(f'[summary] wrote {out_path}')
+
 
 def _print_final_summary(total_wall, summaries):
     print('\n========== [summary] ==========')
@@ -2051,13 +2101,15 @@ def main():
                     help='[crop] target_crops fetch-cap 산출용 예상 crops/img. '
                          '명시 안 하면 min(12, max_keep) — max_keep 으로 yield 가 cap 되므로 '
                          '자동 연동. probe 측정 12.13 (cap=100 기준).')
-    ap.add_argument('--expected_decode_rate', type=float, default=0.75,
-                    help='[crop] target_crops fetch-cap 산출용 예상 fetch ok rate '
-                         '(probe 측정 0.751).')
-    ap.add_argument('--fetch_safety', type=float, default=1.5,
+    ap.add_argument('--expected_decode_rate', type=float, default=0.5,
+                    help='[crop] target_crops fetch-cap 산출용 예상 fetch ok rate. '
+                         'probe 측정 0.751 이지만 small target / dead URL ratio 변동 '
+                         '커서 보수적으로 0.5 (target 미달 방지 우선).')
+    ap.add_argument('--fetch_safety', type=float, default=2.5,
                     help='[crop] fetch upper-bound safety multiplier — yield/decode 가 '
-                         '예상보다 나빠도 target 도달하도록. 1.0 이면 hard cap, '
-                         '2.0+ 이면 안전 우선.')
+                         '예상보다 나빠도 target 도달하도록. 1.0 이면 hard cap. '
+                         'default 2.5 = decode/yield 변동 + producer/consumer race '
+                         '모두 흡수. 더 줄이면 fetch 적게 시도 → target 미달 risk.')
     ap.add_argument('--chunk_crops', type=int, default=None,
                     help='[crop] chunked processing — 한 chunk 당 추가할 crop 수. '
                          '명시 안 하면 --target_crops 기반 자동 산정 '
@@ -2082,6 +2134,12 @@ def main():
     ap.add_argument('--lmdb_map_size', type=int, default=1 << 40,
                     help='[crop] LMDB env map_size (sparse alloc on Linux). '
                          'default 1TB — 부족하면 키워야 OS-level error 안 남.')
+    ap.add_argument('--fp16', action='store_true',
+                    help='[crop] torch.autocast(cuda, fp16) 로 mixed precision '
+                         'inference. weights 는 fp32 유지하고 autocast 가 op별 fp16 '
+                         'kernel 자동 dispatch. deformable attention 같이 fp16 kernel '
+                         '없는 custom op 는 fp32 fallback. output (lmdb/crops_preview/'
+                         'SUMMARY) 모두 _fp16 suffix 로 분리되어 fp32 와 비교 가능.')
 
     args = ap.parse_args()
 
@@ -2192,7 +2250,9 @@ def main():
         summary.setdefault('wall', time.time() - step_t0)
         summaries.append(summary)
 
-    _print_final_summary(time.time() - SCRIPT_T0, summaries)
+    total_wall = time.time() - SCRIPT_T0
+    _print_final_summary(total_wall, summaries)
+    _write_run_summary(args, total_wall, summaries)
 
 
 if __name__ == '__main__':
