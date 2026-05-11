@@ -40,6 +40,30 @@ multi-machine:
 import time
 SCRIPT_T0 = time.time()
 
+import resource as _resource
+import sys as _sys_for_fd
+
+
+def _bump_fd_limit():
+    """RLIMIT_NOFILE soft → hard (또는 65536) 까지 자동 상향.
+
+    282 shards × parquet/.npy reader + 128 fetch threads + lmdb 등이 동시에
+    파일을 잡으면 default soft 1024 로 OSError [Errno 24] Too many open files
+    발생. hard limit 까지는 root 없이도 set 가능. 실패해도 fatal 아니라 warn 만.
+    """
+    try:
+        soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+        target = hard if hard > 0 else 65536
+        if soft < target:
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (target, hard))
+    except Exception as e:
+        print(f'[warn] could not raise RLIMIT_NOFILE: {e}',
+              file=_sys_for_fd.stderr)
+
+
+_bump_fd_limit()
+
+
 import argparse
 import base64
 import html
@@ -1646,6 +1670,10 @@ def run_crop(args):
     fetch_wall_total = 0.0
     chunk_idx = 0
     crops_at_run_start = lmdb_state['idx']
+    # display 용 endpoint — 이번 run 끝나면 lmdb 가 도달할 위치.
+    # break/chunk 로직은 여전히 args.target_crops (per-run) 기준 — 여기는 표시만.
+    crops_target_endpoint = (crops_at_run_start + args.target_crops
+                             if args.target_crops > 0 else 0)
 
     t0 = time.time()
     try:
@@ -1688,10 +1716,12 @@ def run_crop(args):
                 stats['chunk_start_idx'] = lmdb_state['idx']
 
             if args.chunk_crops > 0:
-                tot_label = f'/{args.target_crops:,}' if args.target_crops else ''
+                # progress 는 lmdb 누적 (기존 + 이번 run) / endpoint 로 표시.
+                tot_label = (f'/{crops_target_endpoint:,}'
+                             if crops_target_endpoint else '')
                 print(f'\n[crop] chunk {chunk_idx}: target +{chunk_tc:,} crops, '
                       f'fetch cap {chunk_fc:,} '
-                      f'(progress {crops_so_far:,}{tot_label})', flush=True)
+                      f'(progress {lmdb_state["idx"]:,}{tot_label})', flush=True)
 
             chunk_stop = threading.Event()
             chunk_fetch_q: Queue = Queue(maxsize=args.queue_size)
@@ -1742,10 +1772,11 @@ def run_crop(args):
 
             chunk_added = lmdb_state['idx'] - chunk_lmdb_idx_at_start
             if args.chunk_crops > 0:
-                tot = lmdb_state['idx'] - crops_at_run_start
-                tot_label = f'/{args.target_crops:,}' if args.target_crops else ''
+                # total 도 lmdb 누적 (기존 포함) / endpoint 로 표시.
+                tot_label = (f'/{crops_target_endpoint:,}'
+                             if crops_target_endpoint else '')
                 print(f'[crop] chunk {chunk_idx} done: +{chunk_added:,} crops '
-                      f'(total {tot:,}{tot_label})', flush=True)
+                      f'(total {lmdb_state["idx"]:,}{tot_label})', flush=True)
 
             # Row HWM checkpoint persist — fully-done shards 는 done_path 가 진실,
             # 진행 중 shard 만 progress_state 에 남김.
