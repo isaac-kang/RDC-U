@@ -731,7 +731,8 @@ def write_filter_preview(args, fs=None, paths=None):
 # step: crop — URL → memory → DPText-DETR (ArT + TT) raw → AABB-NMS → AABB crop + LMDB
 # ═════════════════════════════════════════════════════════════════════════
 
-def _iter_shard_metas(shard_paths, fs, out_root, stop_event, stats=None):
+def _iter_shard_metas(shard_paths, fs, out_root, stop_event, stats=None,
+                      progress_rows=None):
     """yields (shard_name, metas_chunk). meta = {'shard','row','url'}.
 
     Q3.1: row group 단위 yield — 한 shard 의 첫 RG 만 읽고도 producer 가
@@ -741,9 +742,14 @@ def _iter_shard_metas(shard_paths, fs, out_root, stop_event, stats=None):
     stats 가 주어지면 parquet open + row_group read 누적 시간을
     stats['t_parquet'] 에 기록.
 
+    progress_rows: dict[shard_name -> max_submitted_row] — resume HWM.
+    해당 shard 에서 row ≤ HWM 은 skip (이전 run 에서 submit 한 것으로 간주).
+
     Note: re_caption column 은 step 1 filter 단계에서만 필요. crop step 은
     이미 .npy index 로 row 가 결정돼 있으므로 'url' 만 읽으면 충분.
     """
+    progress_rows = progress_rows or {}
+
     def _add_parquet(dt):
         if stats is None:
             return
@@ -762,6 +768,7 @@ def _iter_shard_metas(shard_paths, fs, out_root, stop_event, stats=None):
         matched = _load_shard_index(out_root, shard_name)
         if matched is None or matched.size == 0:
             continue
+        hwm = progress_rows.get(shard_name)
         try:
             t_open = time.time()
             f = fs.open(shard_path, 'rb')
@@ -781,6 +788,10 @@ def _iter_shard_metas(shard_paths, fs, out_root, stop_event, stats=None):
                 if lo == hi:
                     offset_rg += rg_size
                     continue
+                # whole-RG fast skip when every matched row is at/below HWM.
+                if hwm is not None and int(matched[hi - 1]) <= hwm:
+                    offset_rg += rg_size
+                    continue
                 t_rg = time.time()
                 tbl = pf.read_row_group(rg, columns=['url'])
                 _add_parquet(time.time() - t_rg)
@@ -790,10 +801,13 @@ def _iter_shard_metas(shard_paths, fs, out_root, stop_event, stats=None):
                 for pos in rg_positions:
                     if stop_event.is_set():
                         break
+                    row = offset_rg + pos
+                    if hwm is not None and row <= hwm:
+                        continue
                     u = urls[pos]
                     if not u:
                         continue
-                    rg_metas.append({'shard': shard_name, 'row': offset_rg + pos,
+                    rg_metas.append({'shard': shard_name, 'row': row,
                                      'url': u})
                 offset_rg += rg_size
                 if rg_metas:
@@ -803,7 +817,7 @@ def _iter_shard_metas(shard_paths, fs, out_root, stop_event, stats=None):
 
 
 def _stream_shard_metas(shard_paths, fs, out_root, stop_event, stats=None,
-                        prefetch=4):
+                        prefetch=4, progress_rows=None):
     """Q3.2: parquet I/O 를 background thread 에서 미리 진행.
     main thread (producer) 가 fetch submit 하는 동안 다음 row_group/shard 읽기.
     """
@@ -813,12 +827,21 @@ def _stream_shard_metas(shard_paths, fs, out_root, stop_event, stats=None,
     def _reader():
         try:
             for item in _iter_shard_metas(
-                    shard_paths, fs, out_root, stop_event, stats):
+                    shard_paths, fs, out_root, stop_event, stats,
+                    progress_rows=progress_rows):
                 if stop_event.is_set():
                     break
                 chunk_q.put(item)
         except Exception as e:
-            print(f'[parquet-reader] err: {e}', flush=True)
+            msg = f'parquet-reader: {type(e).__name__}: {e}'
+            print(f'[parquet-reader] err: {msg}', flush=True)
+            # fail-fast: 정상 exhaustion 으로 위장되지 않도록 fatal flag 설정 +
+            # master_stop 전파.
+            if stats is not None:
+                with stats['lock']:
+                    if not stats.get('fatal_err'):
+                        stats['fatal_err'] = msg
+            stop_event.set()
         finally:
             chunk_q.put(SENTINEL)
 
@@ -878,6 +901,25 @@ class _PushbackIter:
 def _mark_shard_done(done_path, shard_name):
     with open(done_path, 'a') as df:
         df.write(shard_name + '\n')
+
+
+def _load_progress_rows(progress_path):
+    """resume HWM 로드. {shard_name: max_submitted_row}. 파일 없거나 깨졌으면 {}."""
+    if not progress_path.exists():
+        return {}
+    try:
+        raw = json.loads(progress_path.read_text())
+        return {str(k): int(v) for k, v in raw.items()}
+    except Exception as e:
+        print(f'[progress] load fail ({e}), starting clean', flush=True)
+        return {}
+
+
+def _save_progress_rows(progress_path, rows):
+    """atomic write — temp file + rename."""
+    tmp = progress_path.with_suffix(progress_path.suffix + '.tmp')
+    tmp.write_text(json.dumps(rows, sort_keys=True))
+    tmp.replace(progress_path)
 
 
 def _producer_run_threads(metas_iter, fetch_q, fetch_threads, timeout,
@@ -958,6 +1000,11 @@ def _producer_run_threads(metas_iter, fetch_q, fetch_threads, timeout,
                     broke_mid_rg = True
                     gen_exhausted = False
                     break
+                if stats.get('fatal_err'):
+                    metas_iter.push((shard_name, metas[i:]))
+                    broke_mid_rg = True
+                    gen_exhausted = False
+                    break
                 if fetch_cap > 0 and n_submitted >= fetch_cap:
                     metas_iter.push((shard_name, metas[i:]))
                     submission_cap_hit = True
@@ -966,6 +1013,11 @@ def _producer_run_threads(metas_iter, fetch_q, fetch_threads, timeout,
                     break
                 shard_state['futs'][shard_name].append(
                     pool.submit(_fetch_then_push, m))
+                # row HWM tracking — resume 시 이 값 이하 row 는 skip.
+                row = m['row']
+                cur = shard_state['max_row'].get(shard_name, -1)
+                if row > cur:
+                    shard_state['max_row'][shard_name] = row
                 n_submitted += 1
                 i += 1
 
@@ -1090,7 +1142,13 @@ def _safe_predict_batch(predictor, imgs_bgr, stats, device):
             left = _safe_predict_batch(predictor, imgs_bgr[:mid], stats, device)
             right = _safe_predict_batch(predictor, imgs_bgr[mid:], stats, device)
             return left + right
-        print(f'[gpu] err on {device}: {type(e).__name__}: {e}', flush=True)
+        msg = f'gpu {device}: {type(e).__name__}: {e}'
+        print(f'[gpu] err on {msg}', flush=True)
+        # fail-fast: CUDA context 한 번 깨지면 같은 device 의 후속 launch 도
+        # 줄줄이 실패하므로 spin 대신 fatal_err 로 main 에 신호.
+        with stats['lock']:
+            if not stats.get('fatal_err'):
+                stats['fatal_err'] = msg
         return [None] * len(imgs_bgr)
 
 
@@ -1143,8 +1201,8 @@ def _gpu_consumer_run(device, fetch_q, post_q, predictors, batch_size,
         if item is END:
             _flush_to_post()
             return
-        if stop_event.is_set():
-            continue  # drain 만 하고 처리 X
+        if stop_event.is_set() or stats.get('fatal_err'):
+            continue  # drain 만 하고 처리 X (fatal_err 시도 join 위해 END 까지 받음)
         pending.append(item)
         if len(pending) >= batch_size:
             _flush_to_post()
@@ -1387,6 +1445,12 @@ def run_crop(args):
     done_set = set()
     if done_path.exists():
         done_set = {l.strip() for l in done_path.read_text().splitlines() if l.strip()}
+    progress_path = args.out_root / f'_progress_rows{suffix}.json'
+    progress_state = _load_progress_rows(progress_path)
+    # done shards 는 progress_state 에서 제거 (불필요).
+    for s in list(progress_state.keys()):
+        if s in done_set:
+            progress_state.pop(s)
 
     fs = HfFileSystem()
     paths = sorted(fs.glob(f'datasets/{args.dataset}/data/train_data/*.parquet'))
@@ -1543,6 +1607,7 @@ def run_crop(args):
         'fetch_cap': fetch_cap, 'n_submitted': 0, 'n_skipped_by_cap': 0,
         'chunk_start_idx': 0,
         'gen_exhausted': False,
+        'fatal_err': None,
         't_fetch': 0.0, 't_fetch_ok': 0.0, 't_fetch_fail': 0.0,
         't_gpu': 0.0, 't_crop': 0.0, 't_write': 0.0,
         't_parquet': 0.0,
@@ -1569,9 +1634,14 @@ def run_crop(args):
     # Chunked pipeline: 모델/lmdb/metas_iter 는 persistent. threads 는 chunk 마다 spawn-and-join.
     # _PushbackIter 로 mid-RG break 시 unsubmitted metas slice 를 다음 chunk 가 이어받게 함.
     master_stop = threading.Event()
-    shard_state = {'futs': {}, 'mark_threads': [], 'current_shard': None}
+    shard_state = {'futs': {}, 'mark_threads': [], 'current_shard': None,
+                   'max_row': {}}
     metas_iter = _PushbackIter(
-        _stream_shard_metas(paths, fs, args.out_root, master_stop, stats))
+        _stream_shard_metas(paths, fs, args.out_root, master_stop, stats,
+                            progress_rows=progress_state))
+    if progress_state:
+        print(f'[crop] row HWM resume: {len(progress_state)} partial shard(s)'
+              f' (skip rows ≤ HWM)', flush=True)
 
     fetch_wall_total = 0.0
     chunk_idx = 0
@@ -1581,6 +1651,8 @@ def run_crop(args):
     try:
         while True:
             if master_stop.is_set():
+                break
+            if stats.get('fatal_err'):
                 break
             if stats.get('gen_exhausted'):
                 break
@@ -1675,6 +1747,22 @@ def run_crop(args):
                 print(f'[crop] chunk {chunk_idx} done: +{chunk_added:,} crops '
                       f'(total {tot:,}{tot_label})', flush=True)
 
+            # Row HWM checkpoint persist — fully-done shards 는 done_path 가 진실,
+            # 진행 중 shard 만 progress_state 에 남김.
+            done_set_now = set()
+            if done_path.exists():
+                done_set_now = {l.strip() for l
+                                in done_path.read_text().splitlines() if l.strip()}
+            for s, mr in shard_state.get('max_row', {}).items():
+                if s in done_set_now:
+                    progress_state.pop(s, None)
+                else:
+                    progress_state[s] = max(progress_state.get(s, -1), mr)
+            try:
+                _save_progress_rows(progress_path, progress_state)
+            except Exception as e:
+                print(f'[progress] save fail (non-fatal): {e}', flush=True)
+
             if args.chunk_crops <= 0:
                 break  # single-chunk legacy mode
             if chunk_added == 0:
@@ -1709,6 +1797,23 @@ def run_crop(args):
         pbar.close()
         lmdb_env.sync()
         lmdb_env.close()
+        # 마지막 progress persist — fatal_err / interrupt 시에도 resume 가능하게.
+        try:
+            done_set_final = set()
+            if done_path.exists():
+                done_set_final = {l.strip() for l
+                                  in done_path.read_text().splitlines() if l.strip()}
+            for s, mr in shard_state.get('max_row', {}).items():
+                if s in done_set_final:
+                    progress_state.pop(s, None)
+                else:
+                    progress_state[s] = max(progress_state.get(s, -1), mr)
+            _save_progress_rows(progress_path, progress_state)
+        except Exception as e:
+            print(f'[progress] final save fail (non-fatal): {e}', flush=True)
+
+    if stats.get('fatal_err'):
+        raise RuntimeError(f"crop aborted: {stats['fatal_err']}")
 
     # Legacy variable 호환 — 후속 summary print 에서 fetch_wall 사용.
     fetch_wall = fetch_wall_total
@@ -1969,13 +2074,17 @@ def _fresh_start(args, requested):
             args.out_root / 'filter_preview.html',
         ])
     if 'crop' in requested:
+        # NOTE: --fresh 는 *현재 args 의 suffix* 에 해당하는 exp 만 지움 —
+        # 다른 (target_crops, max_keep, shard_mod) 조합의 LMDB 는 손대지 않음.
         targets.extend([
             args.out_root / 'debug' / 'originals',
             args.out_root / 'crops_preview.html',
         ])
-        targets.extend(args.out_root.glob('crops*'))
-        targets.extend(args.out_root.glob('lmdb*'))
-        targets.extend(args.out_root.glob('_done_shards*.txt'))
+        suffix = _crop_run_suffix(args)
+        targets.append(args.out_root / f'crops{suffix}')
+        targets.append(args.out_root / f'lmdb{suffix}')
+        targets.append(args.out_root / f'_done_shards{suffix}.txt')
+        targets.append(args.out_root / f'_progress_rows{suffix}.json')
 
     seen = set()
     removed = []
