@@ -76,6 +76,7 @@ import shutil
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
 
@@ -2012,12 +2013,55 @@ def run_crop(args):
 # CLI
 # ═════════════════════════════════════════════════════════════════════════
 
+_CROP_SUMMABLE = (
+    'urls_tried', 'urls_decoded', 'decoded_not_processed',
+    'gpu_imgs', 'crops', 'target_crops_written', 'batches',
+    'fetch_sum', 'gpu_sum', 'crop_sum', 'write_sum', 'parquet_sum',
+    'fetch_wall', 'gpu_wall', 'crop_wall', 'write_wall', 'parquet_wall',
+    'pipeline_wall', 'wall',
+)
+_FILTER_SUMMABLE = ('wall', 'scan_wall', 'rows', 'matched')
+
+
+def _cumulative_from_runs(runs):
+    """Per-run entries 에서 누적 통계 산출. crop.target_crops_lmdb_total /
+    target_crops_met 처럼 snapshot 인 값은 latest run 값을 그대로 채용."""
+    cum_total_wall = 0.0
+    crop_sum = {k: 0 for k in _CROP_SUMMABLE}
+    filter_sum = {k: 0 for k in _FILTER_SUMMABLE}
+    for r in runs:
+        cum_total_wall += float(r.get('total_wall_seconds') or 0)
+        rcrop = (r.get('steps') or {}).get('crop') or {}
+        for k in _CROP_SUMMABLE:
+            v = rcrop.get(k)
+            if v is not None:
+                crop_sum[k] += v
+        rfilter = (r.get('steps') or {}).get('filter') or {}
+        for k in _FILTER_SUMMABLE:
+            v = rfilter.get(k)
+            if v is not None:
+                filter_sum[k] += v
+    latest = runs[-1] if runs else {}
+    latest_crop = (latest.get('steps') or {}).get('crop') or {}
+    snapshot = {
+        'target_crops': latest_crop.get('target_crops', 0),
+        'target_crops_lmdb_total': latest_crop.get('target_crops_lmdb_total', 0),
+        'target_crops_met': latest_crop.get('target_crops_met', False),
+    }
+    return {
+        'total_wall_seconds': round(cum_total_wall, 1),
+        'crop': {**crop_sum, **snapshot},
+        'filter': filter_sum,
+    }
+
+
 def _write_run_summary(args, total_wall, summaries):
-    """전체 실행 통계를 out_root/SUMMARY{suffix}.json 으로 저장.
-    LMDB/crops 와 동일한 suffix (예: _t10K_k5) 를 써서 setting 별로 분리.
-    args 직렬화 시 Path/tuple 등은 default=str 로 fallback."""
-    payload = {
-        'dataset': getattr(args, 'dataset', None),
+    """전체 실행 통계를 out_root/SUMMARY{suffix}.json 으로 누적 저장.
+    Resume 시 이전 run 의 entry 를 보존하고 이번 run 을 `runs` 배열 끝에 append.
+    `cumulative` 필드로 phase-별 합계를 같이 기록. Legacy single-run JSON 은
+    감지해서 `runs[0]` 으로 마이그레이션."""
+    run_payload = {
+        'finished_at_utc': datetime.now(timezone.utc).isoformat(),
         'steps_requested': args.steps,
         'total_wall_seconds': round(total_wall, 1),
         'args': vars(args),
@@ -2026,9 +2070,33 @@ def _write_run_summary(args, total_wall, summaries):
     }
     suffix = _crop_run_suffix(args)
     out_path = args.out_root / f'SUMMARY{suffix}.json'
+
+    runs = []
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text())
+        except Exception as e:
+            print(f'[summary] could not parse existing {out_path.name} ({e}); '
+                  f'starting new history', flush=True)
+            existing = None
+        if isinstance(existing, dict):
+            if isinstance(existing.get('runs'), list):
+                runs = existing['runs']
+            elif 'steps' in existing:
+                # legacy single-run format → migrate as first run
+                runs = [existing]
+
+    runs.append(run_payload)
+
+    container = {
+        'dataset': getattr(args, 'dataset', None),
+        'total_runs': len(runs),
+        'cumulative': _cumulative_from_runs(runs),
+        'runs': runs,
+    }
     out_path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False, default=str))
-    print(f'[summary] wrote {out_path}')
+        json.dumps(container, indent=2, ensure_ascii=False, default=str))
+    print(f'[summary] wrote {out_path} (run #{len(runs)})')
 
 
 def _print_final_summary(total_wall, summaries):
@@ -2167,6 +2235,7 @@ def _fresh_start(args, requested):
         targets.append(args.out_root / f'lmdb{suffix}')
         targets.append(args.out_root / f'_done_shards{suffix}.txt')
         targets.append(args.out_root / f'_progress_rows{suffix}.json')
+        targets.append(args.out_root / f'SUMMARY{suffix}.json')
 
     seen = set()
     removed = []
