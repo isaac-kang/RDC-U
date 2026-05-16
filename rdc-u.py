@@ -5,7 +5,7 @@ stages — `--steps` 에 comma-separated 로 조합:
   filter : 모든 train shard 의 caption-pass row index 를 .npy 로 저장하고,
            일부 filtered row 는 URL 다운로드 → filter_preview.html 로 시각 검수
   crop   : (filter index 사용) URL → memory → DPText-DETR (ArT + Total-Text,
-           둘 다 R50) raw output 합산 → AABB-NMS (IoU>0.5, top-100) →
+           둘 다 R50) raw output 합산 → AABB-NMS (IoU>0.5, max_keep random cap) →
            AABB crop → LMDB.
            Union14M-U 호환 unlabeled LMDB (image-NNNNNNNNN + num-samples,
            label key 없음 — SLD 의 unlabeled auto-detect 와 호환). 개별 jpg 는
@@ -66,6 +66,7 @@ _bump_fd_limit()
 
 import argparse
 import base64
+import hashlib
 import html
 import io
 import json
@@ -74,7 +75,7 @@ import re
 import shutil
 import sys
 import threading
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from queue import Queue
 
@@ -117,7 +118,7 @@ DEFAULT_DS = 'UCSC-VLAA/Recap-DataComp-1B'
 
 # DPText-DETR (AAAI'23) 두 finetune (ArT + Total-Text, 둘 다 R50). DETR 계열이라
 # 자체 NMS 가 없고 num_queries 별 score thresholding 만. 두 model 의 raw output 을
-# 합쳐서 AABB-NMS (IoU>0.5) + top-100 cap → ArT 의 회전·곡선·inverse + TT 의 curved
+# 합쳐서 AABB-NMS (IoU>0.5) + max_keep random cap → ArT 의 회전·곡선·inverse + TT 의 curved
 # scene 을 모두 cover.
 RDC_ROOT = Path(__file__).resolve().parent
 DPTEXT_REPO = RDC_ROOT / 'local-models' / 'DPText-DETR'
@@ -286,7 +287,7 @@ def _aabb_iou(a, b):
 
 def aabb_nms_combined(entries, iou_thr: float, max_keep: int, rng=None):
     """Greedy AABB-NMS — IoU 측정만 AABB. NMS 자체는 score 내림차순 (overlap group
-    에서 best 를 keep) 이지만, NMS 통과 detection 이 max_keep 보다 많으면 score top-K
+    에서 best 를 keep) 이지만, NMS 통과 detection 이 max_keep 보다 많으면 score prefix
     가 아니라 *랜덤* K 개 sampling.
 
     entries: list of {'poly': np.ndarray (N,2), 'score': float}.
@@ -317,6 +318,18 @@ def aabb_nms_combined(entries, iou_thr: float, max_keep: int, rng=None):
         sampler = rng if rng is not None else random
         keep = sampler.sample(keep, max_keep)
     return [(bb[0], bb[1], bb[2], bb[3], sc) for sc, bb in keep]
+
+
+def _rng_for_meta(seed: int, meta) -> random.Random:
+    """Stable per-image RNG.
+
+    Thread scheduling changes completion order, so global/module random makes
+    max_keep sampling non-reproducible. Derive a local RNG from CLI seed and
+    immutable source identity instead.
+    """
+    key = f'{seed}:{meta.get("shard", "")}:{meta.get("row", "")}'.encode()
+    digest = hashlib.blake2b(key, digest_size=8).digest()
+    return random.Random(int.from_bytes(digest, 'big'))
 
 
 def overlay_polygons(img_bgr: np.ndarray, polys, scores=None) -> np.ndarray:
@@ -459,12 +472,17 @@ def run_index(args):
         'wall_seconds': round(wall, 1),
         'workers': args.workers,
     }
+    summary_path = out_dir / 'SUMMARY.json'
+    summary_path.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False, default=str),
+        encoding='utf-8')
     print(f'[filter] timing  : wall {fmt_secs(wall)}')
     rows_txt = f'{rows_total:,}' if rows_total else 'unknown (cached index)'
     rate_txt = f' ({100 * match_rate:.2f}%)' if match_rate is not None else ''
     cache_txt = f', cached shards {n_cached}/{n_done}' if n_cached else ''
     print(f'[filter] rows    : {rows_txt}{cache_txt}')
     print(f'[filter] matched : {matched_total:,}{rate_txt}')
+    print(f'[filter] summary : {summary_path}')
     preview_summary = write_filter_preview(args, fs=fs, paths=paths)
     return {
         'step': 'filter',
@@ -665,10 +683,10 @@ def write_filter_preview(args, fs=None, paths=None):
     fetch_t0 = time.time()
     workers = max(1, min(args.filter_preview_threads, n, max(len(candidates), 1)))
 
-    def _fetch_candidate(cand):
+    def _fetch_candidate(seq, cand):
         t1 = time.time()
         img_bgr = fetch_image_bgr(cand['url'], args.timeout)
-        return cand, img_bgr, time.time() - t1
+        return seq, cand, img_bgr, time.time() - t1
 
     def _write_item(cand, img_bgr):
         idx = len(items)
@@ -686,39 +704,26 @@ def write_filter_preview(args, fs=None, paths=None):
             'org_caption': cand['org_caption'],
         })
 
+    successful = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        candidate_iter = iter(candidates)
-        pending = set()
-        stop_submitting = False
+        futures = [
+            ex.submit(_fetch_candidate, seq, cand)
+            for seq, cand in enumerate(candidates)
+        ]
+        attempts = len(futures)
+        for fut in as_completed(futures):
+            seq, cand, img_bgr, dt = fut.result()
+            t_fetch += dt
+            if img_bgr is not None:
+                successful.append((seq, cand, img_bgr))
 
-        def _submit_one():
-            nonlocal attempts
-            cand = next(candidate_iter)
-            pending.add(ex.submit(_fetch_candidate, cand))
-            attempts += 1
-
-        for _ in range(workers):
-            try:
-                _submit_one()
-            except StopIteration:
-                break
-
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for fut in done:
-                cand, img_bgr, dt = fut.result()
-                t_fetch += dt
-                if len(items) < n and img_bgr is not None:
-                    _write_item(cand, img_bgr)
-                    pbar.update(1)
-                    if len(items) >= n:
-                        stop_submitting = True
-
-            while not stop_submitting and len(pending) < workers:
-                try:
-                    _submit_one()
-                except StopIteration:
-                    break
+    # Keep preview selection stable for a fixed seed. Network/thread completion
+    # order may vary, so choose the first N successful candidates in seeded
+    # candidate order, not completion order.
+    successful.sort(key=lambda x: x[0])
+    for _, cand, img_bgr in successful[:n]:
+        _write_item(cand, img_bgr)
+        pbar.update(1)
     pbar.close()
 
     fetch_wall = time.time() - fetch_t0
@@ -948,12 +953,14 @@ def _save_progress_rows(progress_path, rows):
 
 def _producer_run_threads(metas_iter, fetch_q, fetch_threads, timeout,
                           chunk_stop, master_stop, n_consumers, stats,
-                          shard_state, done_path):
+                          shard_state):
     """One chunk's producer. metas_iter 는 chunks 간 공유되는 generator —
     이 chunk 가 fetch_cap 만큼 submit 후 yield 끊고 다음 chunk producer 가 이어 받음.
 
-    shard_state: {'futs': dict[shard_name -> [Future]], 'mark_threads': list,
-                  'current_shard': str|None} — chunk 경계를 가로지르는 shard tracking.
+    shard_state: {'pending_done': list[str], 'current_shard': str|None} —
+                  chunk 경계를 가로지르는 shard tracking. Done markers are
+                  written by the main thread only after downstream GPU/post
+                  workers have joined, not when fetch futures finish.
     """
     pool = ThreadPoolExecutor(max_workers=fetch_threads)
 
@@ -979,18 +986,8 @@ def _producer_run_threads(metas_iter, fetch_q, fetch_threads, timeout,
             return
         fetch_q.put((meta, img))
 
-    def _wait_and_mark(futs, shard_name):
-        for fut in futs:
-            try:
-                fut.result()
-            except Exception:
-                pass
-        if not master_stop.is_set():
-            _mark_shard_done(done_path, shard_name)
-
     fetch_cap = stats.get('fetch_cap', 0)
     n_submitted = 0
-    submission_cap_hit = False
     gen_exhausted = True  # 기본 True; break 시 False 로
     try:
         for shard_name, metas in metas_iter:
@@ -1000,14 +997,9 @@ def _producer_run_threads(metas_iter, fetch_q, fetch_threads, timeout,
             # 이전 chunk 가 끝냈을 수도 있는 shard 의 mark_done 처리는 transition 시점에.
             if shard_name != shard_state['current_shard']:
                 prev = shard_state['current_shard']
-                if prev is not None and prev in shard_state['futs']:
-                    pf = shard_state['futs'].pop(prev)
-                    t = threading.Thread(target=_wait_and_mark,
-                                         args=(pf, prev), daemon=True)
-                    t.start()
-                    shard_state['mark_threads'].append(t)
+                if prev is not None:
+                    shard_state['pending_done'].append(prev)
                 shard_state['current_shard'] = shard_name
-                shard_state['futs'].setdefault(shard_name, [])
 
             # RG 안에서 row 단위 cap/stop check + pushback.
             # chunk_stop / fetch_cap 가 row i 에서 fire 하면 metas[i:] 를 push back →
@@ -1031,12 +1023,10 @@ def _producer_run_threads(metas_iter, fetch_q, fetch_threads, timeout,
                     break
                 if fetch_cap > 0 and n_submitted >= fetch_cap:
                     metas_iter.push((shard_name, metas[i:]))
-                    submission_cap_hit = True
                     broke_mid_rg = True
                     gen_exhausted = False
                     break
-                shard_state['futs'][shard_name].append(
-                    pool.submit(_fetch_then_push, m))
+                pool.submit(_fetch_then_push, m)
                 # row HWM tracking — resume 시 이 값 이하 row 는 skip.
                 row = m['row']
                 cur = shard_state['max_row'].get(shard_name, -1)
@@ -1232,13 +1222,14 @@ def _gpu_consumer_run(device, fetch_q, post_q, predictors, batch_size,
             _flush_to_post()
 
 
-def _post_worker_run(post_q, jpeg_quality, score_thr, iou_thr, max_keep,
+def _post_worker_run(post_q, jpeg_quality, score_thr, iou_thr, max_keep, seed,
                      lmdb_env, lmdb_lock, lmdb_state,
                      crops_dir, save_crops,
                      preview_items, preview_lock, preview_n,
                      debug_orig_dir, save_originals, stats, stop_event):
     """GPU forward 결과 (batch + per-image per-detector pred) 받아서
-    raw output 합산 → AABB-NMS (IoU>iou_thr) → top-K → AABB crop → encode →
+    raw output 합산 → AABB-NMS (IoU>iou_thr) → max_keep seeded sample →
+    AABB crop → encode →
     lmdb write → preview.
     GPU consumer 와 병렬 — GPU 가 다음 batch forward 하는 동안 진행.
     """
@@ -1251,7 +1242,6 @@ def _post_worker_run(post_q, jpeg_quality, score_thr, iou_thr, max_keep,
         local_t_crop = 0.0
         local_t_write = 0.0
         local_imgs = 0
-        local_crops = 0
         per_image = []  # (meta, img, polys_per_det, consensus_boxes, kept_crops, encoded_jpgs)
         crop_phase_start = time.time()
         for (meta, img), pred_per_det in zip(batch_pending, preds):
@@ -1271,8 +1261,10 @@ def _post_worker_run(post_q, jpeg_quality, score_thr, iou_thr, max_keep,
                     combined_pool.append({'poly': poly_np, 'score': float(s)})
                 polys_per_det.append(kp)
 
-            # AABB-NMS combined (모든 model raw 합산 → IoU 기준 dedupe → top-K cap)
-            consensus = aabb_nms_combined(combined_pool, iou_thr, max_keep)
+            # AABB-NMS combined (모든 model raw 합산 → IoU 기준 dedupe → seeded cap)
+            consensus = aabb_nms_combined(
+                combined_pool, iou_thr, max_keep,
+                rng=_rng_for_meta(seed, meta))
 
             kept_crops = []
             encoded = []
@@ -1296,15 +1288,13 @@ def _post_worker_run(post_q, jpeg_quality, score_thr, iou_thr, max_keep,
             local_t_crop += time.time() - t1
             per_image.append((meta, img, polys_per_det, consensus, kept_crops, encoded))
             local_imgs += 1
-            local_crops += len(kept_crops)
 
         crop_phase_end = time.time()
         t2 = crop_phase_end
         batch_total = sum(len(e) for _, _, _, _, _, e in per_image)
-        # Chunked mode: target_crops 는 *이번 chunk* 가 추가하기로 한 양.
-        # chunk_start_idx 는 chunk 시작 시점의 lmdb_state['idx'] — 이전 chunk 들 기여 누적.
-        target_crops = stats.get('target_crops', 0) or 0
-        chunk_start_idx = stats.get('chunk_start_idx', 0)
+        # Global target crop cap. Chunking controls how many URLs to submit per
+        # pass; it must not discard valid crops at chunk boundaries.
+        target_lmdb_idx = stats.get('target_lmdb_idx', 0) or 0
         actually_written = 0
         if batch_total:
             with lmdb_lock:
@@ -1314,9 +1304,7 @@ def _post_worker_run(post_q, jpeg_quality, score_thr, iou_thr, max_keep,
                         if done:
                             break
                         for jpg_bytes in encoded:
-                            if (target_crops
-                                    and (lmdb_state['idx'] - chunk_start_idx)
-                                        >= target_crops):
+                            if target_lmdb_idx and lmdb_state['idx'] >= target_lmdb_idx:
                                 done = True
                                 break
                             lmdb_state['idx'] += 1
@@ -1336,28 +1324,28 @@ def _post_worker_run(post_q, jpeg_quality, score_thr, iou_thr, max_keep,
 
         for meta, img, polys_per_det, consensus, kept_crops, _ in per_image:
             if preview_n > 0 and kept_crops:
+                orig_name = f"{meta['shard']}__r{meta['row']:08d}.jpg"
+                vis = overlay_ensemble(img, polys_per_det, consensus)
+                item = {
+                    'name': orig_name,
+                    'vis_b64': encode_jpeg(vis),
+                    'crops': [{'score': box[4], 'b64': encode_jpeg(c)}
+                              for box, c in zip(consensus, kept_crops)],
+                }
                 with preview_lock:
-                    if len(preview_items) < preview_n:
-                        orig_name = f"{meta['shard']}__r{meta['row']:08d}.jpg"
-                        if save_originals:
-                            cv2.imwrite(str(debug_orig_dir / orig_name),
-                                        img, [cv2.IMWRITE_JPEG_QUALITY, 88])
-                        vis = overlay_ensemble(img, polys_per_det, consensus)
-                        preview_items.append({
-                            'name': orig_name,
-                            'vis_b64': encode_jpeg(vis),
-                            'crops': [{'score': box[4], 'b64': encode_jpeg(c)}
-                                      for box, c in zip(consensus, kept_crops)],
-                        })
+                    preview_items.append(item)
+                    preview_items.sort(key=lambda x: x['name'])
+                    del preview_items[preview_n:]
+                    keep_original = any(x['name'] == orig_name for x in preview_items)
+                if save_originals and keep_original:
+                    cv2.imwrite(str(debug_orig_dir / orig_name),
+                                img, [cv2.IMWRITE_JPEG_QUALITY, 88])
 
-        # target_crops trim 적용 시 actually_written 이 local_crops 보다 작을 수 있음.
-        # batch 가 lmdb 안 쓰면 (batch_total=0) actually_written=0 이라 local_crops 그대로 사용.
-        crops_to_record = actually_written if batch_total else local_crops
         with stats['lock']:
             stats['t_crop'] += local_t_crop
             stats['t_write'] += local_t_write
             stats['imgs'] += local_imgs
-            stats['crops'] += crops_to_record
+            stats['crops'] += actually_written
             if local_imgs:
                 if stats['crop_first'] == 0.0 or crop_phase_start < stats['crop_first']:
                     stats['crop_first'] = crop_phase_start
@@ -1373,7 +1361,7 @@ def _post_worker_run(post_q, jpeg_quality, score_thr, iou_thr, max_keep,
 
         if stats['target'] and stats['imgs'] >= stats['target']:
             stop_event.set()
-        if target_crops and (lmdb_state['idx'] - chunk_start_idx) >= target_crops:
+        if target_lmdb_idx and lmdb_state['idx'] >= target_lmdb_idx:
             stop_event.set()
 
 
@@ -1452,6 +1440,11 @@ def _crop_run_suffix(args) -> str:
 def run_crop(args):
     total_t0 = time.time()
     import torch
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
     suffix = _crop_run_suffix(args)
 
     crops_dir = args.out_root / f'crops{suffix}'
@@ -1523,7 +1516,7 @@ def run_crop(args):
     print(f'[crop] fetch      : {args.fetch_threads} threads, '
           f'queue {args.queue_size}, timeout connect={args.timeout[0]}s read={args.timeout[1]}s')
     print(f'[crop] filter     : per-detector score>={args.score_thr}, '
-          f'AABB-NMS IoU>{args.iou_thr}, top-{args.max_keep} per image')
+          f'AABB-NMS IoU>{args.iou_thr}, max_keep={args.max_keep} per image')
     if args.crop_preview_n > 0:
         if args.save_preview_images:
             print(f'[crop] crop_preview_n : {args.crop_preview_n} '
@@ -1627,9 +1620,9 @@ def run_crop(args):
         'pbar': pbar,
         'fp16': bool(getattr(args, 'fp16', False)),
         'imgs': 0, 'crops': 0,
-        'target': args.target, 'target_crops': args.target_crops,
+        'target': args.target,
         'fetch_cap': fetch_cap, 'n_submitted': 0, 'n_skipped_by_cap': 0,
-        'chunk_start_idx': 0,
+        'target_lmdb_idx': 0,
         'gen_exhausted': False,
         'fatal_err': None,
         't_fetch': 0.0, 't_fetch_ok': 0.0, 't_fetch_fail': 0.0,
@@ -1653,13 +1646,19 @@ def run_crop(args):
         existing = _t.get(b'num-samples')
     lmdb_state = {'idx': int(existing) if existing else 0}
     if lmdb_state['idx']:
-        print(f'[crop] lmdb resume : {lmdb_state["idx"]} existing samples')
+        msg = f'[crop] lmdb resume : {lmdb_state["idx"]:,} existing samples'
+        if args.target_crops > 0:
+            remaining_to_target = max(0, args.target_crops - lmdb_state['idx'])
+            if remaining_to_target > 0:
+                msg += f' (target {args.target_crops:,} → need +{remaining_to_target:,})'
+            else:
+                msg += f' (target {args.target_crops:,} already met — no work)'
+        print(msg)
 
     # Chunked pipeline: 모델/lmdb/metas_iter 는 persistent. threads 는 chunk 마다 spawn-and-join.
     # _PushbackIter 로 mid-RG break 시 unsubmitted metas slice 를 다음 chunk 가 이어받게 함.
     master_stop = threading.Event()
-    shard_state = {'futs': {}, 'mark_threads': [], 'current_shard': None,
-                   'max_row': {}}
+    shard_state = {'pending_done': [], 'current_shard': None, 'max_row': {}}
     metas_iter = _PushbackIter(
         _stream_shard_metas(paths, fs, args.out_root, master_stop, stats,
                             progress_rows=progress_state))
@@ -1670,12 +1669,13 @@ def run_crop(args):
     fetch_wall_total = 0.0
     chunk_idx = 0
     crops_at_run_start = lmdb_state['idx']
-    # display 용 endpoint — 이번 run 끝나면 lmdb 가 도달할 위치.
-    # break/chunk 로직은 여전히 args.target_crops (per-run) 기준 — 여기는 표시만.
-    crops_target_endpoint = (crops_at_run_start + args.target_crops
-                             if args.target_crops > 0 else 0)
+    # target_crops 는 absolute total (lmdb 가 도달해야 하는 누적 crop 수).
+    # Resume 시 동일 명령어를 그대로 넘기면 이미 쌓인 crop 포함해서 target 까지 채움.
+    # Chunking 은 URL submission 단위만 나누고, write cap 은 이 endpoint 하나로 건다.
+    crops_target_endpoint = args.target_crops if args.target_crops > 0 else 0
 
     t0 = time.time()
+    normal_exit = False
     try:
         while True:
             if master_stop.is_set():
@@ -1684,23 +1684,26 @@ def run_crop(args):
                 break
             if stats.get('gen_exhausted'):
                 break
-            crops_so_far = lmdb_state['idx'] - crops_at_run_start
-            if args.target_crops > 0 and crops_so_far >= args.target_crops:
+            if args.target_crops > 0 and lmdb_state['idx'] >= args.target_crops:
                 break
             if args.target > 0 and stats['imgs'] >= args.target:
                 break
 
             chunk_idx += 1
 
-            # 이 chunk 의 target_crops + fetch_cap 산정.
+            # 이 chunk 의 target_crops + fetch_cap 산정 — 남은 양 (absolute target
+            # 에서 현재까지 쌓인 lmdb idx 를 뺀 값) 으로 산정.
+            if args.target_crops > 0:
+                remaining = max(0, args.target_crops - lmdb_state['idx'])
+            else:
+                remaining = 0
             if args.chunk_crops > 0:
                 if args.target_crops > 0:
-                    remaining = args.target_crops - crops_so_far
                     chunk_tc = min(args.chunk_crops, remaining)
                 else:
                     chunk_tc = args.chunk_crops
             else:
-                chunk_tc = args.target_crops  # 0 = no cap, single-chunk legacy 동작
+                chunk_tc = remaining  # 0 = no cap, single-chunk legacy 동작
 
             if chunk_tc > 0:
                 ey = max(args.expected_yield, 0.1)
@@ -1711,9 +1714,8 @@ def run_crop(args):
                 chunk_fc = 0
 
             with stats['lock']:
-                stats['target_crops'] = chunk_tc
                 stats['fetch_cap'] = chunk_fc
-                stats['chunk_start_idx'] = lmdb_state['idx']
+                stats['target_lmdb_idx'] = crops_target_endpoint
 
             if args.chunk_crops > 0:
                 # progress 는 lmdb 누적 (기존 + 이번 run) / endpoint 로 표시.
@@ -1733,7 +1735,7 @@ def run_crop(args):
                 t = threading.Thread(
                     target=_post_worker_run,
                     args=(chunk_post_q, args.jpeg_quality,
-                          args.score_thr, args.iou_thr, args.max_keep,
+                          args.score_thr, args.iou_thr, args.max_keep, args.seed,
                           lmdb_env, lmdb_lock, lmdb_state,
                           crops_dir, args.save_crops,
                           preview_items, preview_lock, args.crop_preview_n,
@@ -1757,7 +1759,7 @@ def run_crop(args):
                 target=_producer_run_threads,
                 args=(metas_iter, chunk_fetch_q, args.fetch_threads, args.timeout,
                       chunk_stop, master_stop, n_consumers, stats,
-                      shard_state, done_path),
+                      shard_state),
                 daemon=True)
             fetch_wall_t0 = time.time()
             prod.start()
@@ -1778,21 +1780,30 @@ def run_crop(args):
                 print(f'[crop] chunk {chunk_idx} done: +{chunk_added:,} crops '
                       f'(total {lmdb_state["idx"]:,}{tot_label})', flush=True)
 
-            # Row HWM checkpoint persist — fully-done shards 는 done_path 가 진실,
-            # 진행 중 shard 만 progress_state 에 남김.
-            done_set_now = set()
-            if done_path.exists():
-                done_set_now = {l.strip() for l
-                                in done_path.read_text().splitlines() if l.strip()}
-            for s, mr in shard_state.get('max_row', {}).items():
-                if s in done_set_now:
+            # Row HWM checkpoint persist. This is safe only after producer,
+            # GPU consumers, and post workers have all joined for the chunk.
+            # On fatal errors, keep the previous checkpoint so a rerun retries
+            # possibly submitted-but-unwritten rows instead of silently skipping.
+            if not stats.get('fatal_err'):
+                done_set_now = set()
+                if done_path.exists():
+                    done_set_now = {l.strip() for l
+                                    in done_path.read_text().splitlines() if l.strip()}
+                while shard_state.get('pending_done'):
+                    s = shard_state['pending_done'].pop(0)
+                    if s not in done_set_now:
+                        _mark_shard_done(done_path, s)
+                        done_set_now.add(s)
                     progress_state.pop(s, None)
-                else:
-                    progress_state[s] = max(progress_state.get(s, -1), mr)
-            try:
-                _save_progress_rows(progress_path, progress_state)
-            except Exception as e:
-                print(f'[progress] save fail (non-fatal): {e}', flush=True)
+                for s, mr in shard_state.get('max_row', {}).items():
+                    if s in done_set_now:
+                        progress_state.pop(s, None)
+                    else:
+                        progress_state[s] = max(progress_state.get(s, -1), mr)
+                try:
+                    _save_progress_rows(progress_path, progress_state)
+                except Exception as e:
+                    print(f'[progress] save fail (non-fatal): {e}', flush=True)
 
             if args.chunk_crops <= 0:
                 break  # single-chunk legacy mode
@@ -1806,19 +1817,23 @@ def run_crop(args):
             else:
                 stats['_zero_streak'] = 0
 
-        # metas_iter 가 자연 소진됐으면 마지막 shard 의 futures 도 다 처리됐을 것 — 마크.
-        if (stats.get('gen_exhausted') and shard_state['current_shard'] is not None
-                and shard_state['current_shard'] in shard_state['futs']):
-            last = shard_state['current_shard']
-            futs = shard_state['futs'].pop(last)
-            for f in futs:
-                try:
-                    f.result()
-                except Exception:
-                    pass
-            _mark_shard_done(done_path, last)
-        for t in shard_state.get('mark_threads', []):
-            t.join(timeout=10.0)
+        # metas_iter 가 자연 소진됐으면 마지막 shard 도 downstream 처리 완료 후 마크.
+        if (not stats.get('fatal_err') and stats.get('gen_exhausted')
+                and shard_state['current_shard'] is not None):
+            done_set_now = set()
+            if done_path.exists():
+                done_set_now = {l.strip() for l
+                                in done_path.read_text().splitlines() if l.strip()}
+            if shard_state['current_shard'] not in done_set_now:
+                shard_state['pending_done'].append(shard_state['current_shard'])
+            while shard_state.get('pending_done'):
+                s = shard_state['pending_done'].pop(0)
+                if s not in done_set_now:
+                    _mark_shard_done(done_path, s)
+                    done_set_now.add(s)
+                progress_state.pop(s, None)
+            _save_progress_rows(progress_path, progress_state)
+        normal_exit = not stats.get('fatal_err')
     finally:
         master_stop.set()
         try:
@@ -1828,17 +1843,20 @@ def run_crop(args):
         pbar.close()
         lmdb_env.sync()
         lmdb_env.close()
-        # 마지막 progress persist — fatal_err / interrupt 시에도 resume 가능하게.
+        # 마지막 progress persist. On abnormal exit, do not advance HWM with
+        # rows that may have been submitted but not written.
         try:
-            done_set_final = set()
-            if done_path.exists():
-                done_set_final = {l.strip() for l
-                                  in done_path.read_text().splitlines() if l.strip()}
-            for s, mr in shard_state.get('max_row', {}).items():
-                if s in done_set_final:
-                    progress_state.pop(s, None)
-                else:
-                    progress_state[s] = max(progress_state.get(s, -1), mr)
+            if normal_exit:
+                done_set_final = set()
+                if done_path.exists():
+                    done_set_final = {l.strip() for l
+                                      in done_path.read_text().splitlines()
+                                      if l.strip()}
+                for s, mr in shard_state.get('max_row', {}).items():
+                    if s in done_set_final:
+                        progress_state.pop(s, None)
+                    else:
+                        progress_state[s] = max(progress_state.get(s, -1), mr)
             _save_progress_rows(progress_path, progress_state)
         except Exception as e:
             print(f'[progress] final save fail (non-fatal): {e}', flush=True)
@@ -1862,11 +1880,18 @@ def run_crop(args):
     avg_fetch_fail_ms = (stats['t_fetch_fail'] / fail_n * 1000) if fail_n else 0.0
     avg_batch_ms = stats['t_gpu'] / max(stats['n_batch'], 1) * 1000
     crops_per_img = stats['crops'] / max(processed_imgs, 1)
+    crops_written_this_run = lmdb_state['idx'] - crops_at_run_start
+    crops_lmdb_total = lmdb_state['idx']
+    target_crops_met = (
+        args.target_crops <= 0 or crops_lmdb_total >= args.target_crops)
+    target_img_reached = args.target > 0 and stats['imgs'] >= args.target
+    target_crops_miss = (
+        args.target_crops > 0 and not target_crops_met and not target_img_reached)
     gpu_wall = (stats['gpu_last'] - stats['gpu_first']) if stats['gpu_first'] else 0.0
     crop_wall = (stats['crop_last'] - stats['crop_first']) if stats['crop_first'] else 0.0
     write_wall = (stats['write_last'] - stats['write_first']) if stats['write_first'] else 0.0
     target_note = ''
-    if args.target and stats['imgs'] >= args.target:
+    if target_img_reached:
         target_note = f' (target {args.target} imgs reached; batch/parallel overshoot)'
 
     print()
@@ -1883,6 +1908,13 @@ def run_crop(args):
     print(f'[crop] gpu imgs   : {processed_imgs} processed by DPText-DETR{target_note}')
     print(f'[crop] crops      : {stats["crops"]} '
           f'({crops_per_img:.2f} per gpu img)')
+    if args.target_crops > 0:
+        print(f'[crop] crop target: {crops_lmdb_total:,}/'
+              f'{args.target_crops:,} total '
+              f'(+{crops_written_this_run:,} this run)')
+        if target_crops_miss:
+            print('[crop] ERROR      : target_crops was not reached before '
+                  'available indexed shards were exhausted or progress stopped')
     oom_note = f' · {stats["n_oom"]} OOM-retries' if stats['n_oom'] else ''
     gpu_idle = max(0.0, process_wall - gpu_wall)
     gpu_util_active = stats['t_gpu'] / max(gpu_wall * n_consumers, 1e-9) * 100
@@ -1963,6 +1995,12 @@ def run_crop(args):
         'decoded_not_processed': fetched_not_processed,
         'gpu_imgs': processed_imgs,
         'crops': stats['crops'],
+        'target_crops': args.target_crops,
+        'target_crops_lmdb_total': crops_lmdb_total,
+        'target_crops_written': crops_written_this_run,
+        'target_crops_met': target_crops_met,
+        'target_crops_miss': target_crops_miss,
+        'target_img_reached': target_img_reached,
         'batches': stats['n_batch'],
         'gpus': n_consumers,
         'target': args.target,
@@ -2080,6 +2118,19 @@ def _print_final_summary(total_wall, summaries):
             print(f'       bottleneck              : {bottleneck}')
             print(f'       GPU input images        : {s.get("gpu_imgs", 0)}')
             print(f'       saved crops             : {s.get("crops", 0)}')
+            if s.get('target_crops', 0):
+                if s.get('target_crops_met'):
+                    status = 'met'
+                elif s.get('target_img_reached'):
+                    status = 'stopped by target imgs'
+                else:
+                    status = 'MISS'
+                lmdb_total = s.get('target_crops_lmdb_total',
+                                   s.get('target_crops_written', 0))
+                written = s.get('target_crops_written', 0)
+                print(f'       target crops            : '
+                      f'{lmdb_total:,}/{s.get("target_crops", 0):,} total '
+                      f'(+{written:,} this run) ({status})')
             if backlog:
                 print(f'       decoded backlog skipped : {backlog}')
             if s.get('preview_html'):
@@ -2196,7 +2247,8 @@ def main():
     ap.add_argument('--filter_preview_threads', type=int, default=32,
                     help='[filter-preview] parallel URL fetch threads')
     ap.add_argument('--seed', type=int, default=0,
-                    help='[filter-preview] shuffle seed')
+                    help='[filter/crop] deterministic seed for preview sampling, '
+                         'NumPy/Python/Torch RNG, and per-image max_keep sampling')
     ap.add_argument('--max_attempts', type=int, default=200,
                     help='[filter-preview] dead-URL safety cap')
 
@@ -2209,7 +2261,9 @@ def main():
     ap.add_argument('--iou_thr', type=float, default=0.5,
                     help='[crop] AABB-NMS IoU threshold (combined NMS 후).')
     ap.add_argument('--max_keep', type=int, default=100,
-                    help='[crop] image 당 최종 detection top-K cap. 0 이면 cap 없음.')
+                    help='[crop] image 당 최종 detection cap. NMS 후 이 개수를 넘으면 '
+                         '--seed 와 source row 기반 deterministic random sample. '
+                         '0 이면 cap 없음.')
     ap.add_argument('--jpeg_quality', type=int, default=90)
     ap.add_argument('--batch_size', type=int, default=2,
                     help='[crop] GPU forward batch 크기 — predictor.model([N inputs]) '
@@ -2232,15 +2286,21 @@ def main():
                          '(0 = no cap). 명시 안 하면 --target_crops 가 있을 때 0, '
                          '없을 때 100 (small dev). crop 수가 아니라 GPU 입력 이미지 수.')
     ap.add_argument('--target_crops', type=int, default=0,
-                    help='[crop] stop after N crops written to lmdb (0 = no cap). '
+                    help='[crop] stop when lmdb reaches N crops total (absolute, '
+                         'includes existing crops on resume). 0 = no cap. '
+                         'Resume 시 동일 명령어를 그대로 넘기면 됨 (기존 LMDB 의 idx '
+                         '를 보고 부족한 만큼만 추가 생성). '
                          '--target 와 함께 쓰면 먼저 도달하는 쪽이 stop trigger. '
+                         '--target 에 먼저 도달한 경우를 제외하고 target_crops 미달이면 '
+                         'summary 작성 후 non-zero exit. '
                          '이 값으로 fetch upper-bound 도 자동 산출 — '
                          'ceil(target_crops / expected_yield / expected_decode_rate '
                          '* fetch_safety) 만큼만 producer 가 submit (과도 fetch 방지).')
     ap.add_argument('--expected_yield', type=float, default=None,
                     help='[crop] target_crops fetch-cap 산출용 예상 crops/img. '
-                         '명시 안 하면 min(12, max_keep) — max_keep 으로 yield 가 cap 되므로 '
-                         '자동 연동. probe 측정 12.13 (cap=100 기준).')
+                         '명시 안 하면 min(12, 0.5*max_keep) — max_keep 으로 yield 가 '
+                         'cap 되지만 실제 평균은 보수적으로 절반을 가정. '
+                         'max_keep=0(no cap) 은 12.0.')
     ap.add_argument('--expected_decode_rate', type=float, default=0.5,
                     help='[crop] target_crops fetch-cap 산출용 예상 fetch ok rate. '
                          'probe 측정 0.751 이지만 small target / dead URL ratio 변동 '
@@ -2283,15 +2343,22 @@ def main():
 
     args = ap.parse_args()
 
+    # Make every in-process random choice reproducible for a fixed --seed.
+    # Per-image max_keep sampling additionally derives a local RNG from this
+    # seed and source identity so worker scheduling cannot perturb it.
+    random.seed(args.seed)
+    np.random.seed(args.seed & 0xFFFFFFFF)
+
     # --target sentinel resolve: target_crops 있으면 default 0 (간섭 방지), 없으면 100.
     if args.target is None:
         args.target = 0 if args.target_crops > 0 else 100
 
-    # --expected_yield sentinel resolve: max_keep 으로 cap 되므로 둘 중 작은 값.
+    # --expected_yield sentinel resolve: max_keep 으로 cap 되지만 실제 평균은
+    # 보수적으로 max_keep 의 절반을 가정.
     # max_keep=0 (no cap) 이면 probe 측정값 12.0 그대로.
     if args.expected_yield is None:
         if args.max_keep > 0:
-            args.expected_yield = float(min(12.0, args.max_keep))
+            args.expected_yield = float(min(12.0, 0.5 * args.max_keep))
         else:
             args.expected_yield = 12.0
 
@@ -2307,6 +2374,7 @@ def main():
             # 2x cushion: shard 간 yield 변동 + producer 가 step 2 도중 부족 안 겪게.
             args.max_shards = max(1, int(np.ceil(urls_needed * 2 / matches_per_shard)))
             print(f'[setup] auto --max_shards={args.max_shards} '
+                  f'(applies to filter and crop) '
                   f'(target_crops={args.target_crops:,} → '
                   f'~{matches_per_shard * args.max_shards:,} matched URLs available, '
                   f'baseline need ~{urls_needed:,})', flush=True)
@@ -2393,6 +2461,10 @@ def main():
     total_wall = time.time() - SCRIPT_T0
     _print_final_summary(total_wall, summaries)
     _write_run_summary(args, total_wall, summaries)
+    if any(s.get('target_crops_miss') for s in summaries):
+        print('[summary] ERROR: one or more crop steps did not reach target_crops',
+              file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

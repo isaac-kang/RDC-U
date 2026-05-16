@@ -1,6 +1,6 @@
 # RDC-U — Recap-DataComp 에서 mining 하는 unlabeled STR crop 데이터셋
 
-전체 흐름: parquet `re_caption` 의 regex 필터 → URL fetch → 3-detector ensemble (DBNet++ / FCENet / MaskRCNN, all R50-oCLIP IC15) → unanimous IoU>0.7 voting → axis-aligned bbox crop.
+전체 흐름: parquet `re_caption` 의 regex 필터 → URL fetch → DPText-DETR 2-model ensemble (ArT / Total-Text, R50) → raw polygon 합산 → AABB-NMS → axis-aligned bbox crop.
 
 명명 규칙: U14M-L (labeled) / U14M-U (unlabeled) 와 동일 의미의 "-U" — 글자 transcription 라벨은 없는 unlabeled crop 모음.
 
@@ -13,11 +13,13 @@
 | stage | 번호 | 역할 | 산출물 |
 |---|---|---|---|
 | `filter` | `1` | parquet text column만 보고 caption STR filter 적용. 매치 row index를 `.npy` 로 저장하고, 일부 filtered row는 이미지+텍스트 HTML로 검수 | `<out>/index/<shard>.npy`, `<out>/index/SUMMARY.json`, `<out>/filter_preview.html` |
-| `crop`   | `2` | filter index에 걸린 row만 URL fetch → 3-detector ensemble forward → unanimous IoU voting (paper 방식) → 3 polygon 의 minimum axis-aligned rect 로 crop. crop preview HTML 저장 | `<out>/lmdb/`, `<out>/crops/<key>.jpg` (opt-in), `<out>/crops_preview.html` |
+| `crop`   | `2` | filter index에 걸린 row만 URL fetch → DPText-DETR ArT+TotalText forward → detector raw output 합산 → AABB-NMS → bbox crop. crop preview HTML 저장 | `<out>/lmdb*/`, `<out>/crops*/<key>.jpg` (opt-in), `<out>/crops_preview*.html` |
 
 **의존성**: `crop` 은 같은 `--out_root` 안의 `index/<shard>.npy` 를 읽어 매치 row 만 sparse 접근. index 없는 shard 는 자동 skip. `crop` 단독 실행 (`--steps 2`) 전에 step 1 을 한번 돌려야 함. default `python rdc-u.py` 는 1→2 순서로 돌아 crop 에 필요한 index 를 자동 생성함.
 
 **기본 동작 = small crop 모드.** default 로 `--steps` 미지정 시 filter+crop(1,2), `--max_shards 1`, `--filter_preview_n 10`, `--target 100`. 풀 실행하려면 `--full` 또는 `--max_shards 0 --target 0` 명시.
+
+`--target_crops` 를 주고 `--max_shards` 를 생략하면 `max_keep`, `expected_yield`, `expected_decode_rate`, `fetch_safety` 로 필요한 shard 수를 자동 산정한다. 이 자동 `max_shards` 값은 `--steps 1,2` 실행에서 step 1 filter와 step 2 crop 양쪽에 동일하게 적용된다.
 
 `--steps` 는 이름 또는 번호 사용 가능. 숫자 alias 는 `1=filter`, `2=crop`. `index` 는 `filter` 의 legacy 이름으로 허용.
 
@@ -50,12 +52,16 @@ python rdc-u.py --steps 2 --max_shards 0 --target 100000   # cap 만 지정
 | `--filter_preview_threads N` | filter | filter preview URL fetch 병렬 수. default **32** |
 | `--num_gpus N` | crop | ensemble inference GPU 수 (0 = `torch.cuda.device_count()`) |
 | `--target N` | crop | ensemble 입력 N장 처리하면 stop (0 = no cap). default **100** |
-| `--score_thr` | crop | per-detector polygon score 컷 (voting 전 단계, mmocr default **0.3**) |
-| `--iou_thr` | crop | IoU voting 임계값. 모든 pair IoU 가 이 값 초과해야 consensus (paper 0.7) |
-| `--batch_size` | crop | per-GPU ensemble batch (default **4**, bs=8 까지 검증됨, bs≥10 OOM 위험) |
+| `--target_crops N` | crop | LMDB가 N개 crop에 도달하면 stop (absolute, 기존 crop 포함). Resume 시 동일 명령어 그대로 → 부족분만 추가 생성. `--target` 이미지 cap에 먼저 도달한 경우를 제외하고 미달이면 summary 작성 후 non-zero exit |
+| `--expected_yield` | crop | `--target_crops` 기반 shard/fetch 자동 산정용 crops/img. default `min(12, 0.5*max_keep)`, `max_keep=0`이면 12 |
+| `--score_thr` | crop | per-detector polygon score 컷 (default **0.3**) |
+| `--iou_thr` | crop | AABB-NMS IoU 임계값 (default **0.5**) |
+| `--max_keep` | crop | image당 NMS 후 keep 수. 초과 시 `--seed`와 source row로 deterministic random sample |
+| `--batch_size` | crop | per-GPU ensemble batch (default **2**) |
 | `--fetch_threads` | crop | URL fetch ThreadPool 크기 (default 128) |
 | `--shard_mod / --shard_rem` | crop | 멀티 머신 분산용 shard 분할 |
 | `--crop_preview_n N` | crop | 개발용: N 장은 원본 + polygon overlay HTML 저장 (default 20) |
+| `--seed N` | filter, crop | filter preview shuffle과 crop max_keep sampling을 재현 가능하게 고정 |
 
 ### 출력 디렉토리 구조
 
@@ -67,13 +73,14 @@ python rdc-u.py --steps 2 --max_shards 0 --target 100000   # cap 만 지정
 ├── filter_preview/                       # step:filter preview images
 │   └── recap_00000.jpg ...
 ├── filter_preview.html                   # step:filter preview HTML
-├── crops/                                # step:crop (메인 산출물)
+├── crops*/                               # step:crop loose jpg dump (--save_crops)
 │   └── train-00042-of-04627__r00012345__c00.jpg ...
 ├── debug/originals/                      # step:crop, --crop_preview_n>0
 │   └── train-00042-of-04627__r00012345.jpg ...
-├── crops_preview.html                    # step:crop, --crop_preview_n>0
-├── lmdb/                                 # step:crop (메인 산출물, Union14M-U format)
-└── _done_shards.txt                      # step:crop resume marker
+├── crops_preview*.html                   # step:crop, --crop_preview_n>0
+├── lmdb*/                                # step:crop (메인 산출물, Union14M-U format)
+├── _done_shards*.txt                     # step:crop resume marker
+└── _progress_rows*.json                  # partial shard HWM resume marker
 ```
 
 ### 단계별 timing
@@ -86,9 +93,8 @@ python rdc-u.py --steps 2 --max_shards 0 --target 100000   # cap 만 지정
 
 ## 환경
 
-- `data_env.sh` — conda env `data` 에 HF stream + mmocr 스택 설치
-- 외부 의존: `Union14M/` (mmocr-dev-1.x configs)
+- `create_env_and_download_weights.sh` — conda env `detectron2` 에 torch1.9 + detectron2 v0.6 + DPText-DETR/AdelaiDet 설치
+- 외부 의존: `local-models/DPText-DETR/`, `Union14M/tools/`
 - detector weights (`Union14M/checkpoints/`):
-  - `dbnetpp_oclip.pth`  — DBNet++ R50-oCLIP IC15
-  - `fcenet_oclip.pth`   — FCENet R50-oCLIP IC15
-  - `maskrcnn_oclip.pth` — MaskRCNN R50-oCLIP IC15
+  - `dptext_art_final.pth` — DPText-DETR ArT
+  - `dptext_totaltext.pth` — DPText-DETR Total-Text
